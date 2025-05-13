@@ -2039,6 +2039,72 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             "Fence test failed to reach home (%fm distance) - "
             "timed out after %u seconds" % (home_distance, timeout,))
 
+    def FenceUpload_MissionItem(self, timeout=180):
+        '''Test MISSION_ITEM fence upload/download'''
+        self.set_parameters({
+            "FENCE_ENABLE": 1,
+            "FENCE_TYPE": 6,  # polygon and circle fences
+        })
+
+        self.poll_home_position(quiet=False)
+
+        home_loc = self.mav.location()
+
+        fence_loc = [
+            self.offset_location_ne(home_loc, -110, -110),
+            self.offset_location_ne(home_loc, 110, -110),
+            self.offset_location_ne(home_loc, 110, 110),
+            self.offset_location_ne(home_loc, -110, 110),
+        ]
+
+        seq = 0
+        items = []
+        mission_type = mavutil.mavlink.MAV_MISSION_TYPE_FENCE
+        count = len(fence_loc)
+        for loc in fence_loc:
+            item = self.mav.mav.mission_item_encode(
+                1,
+                1,
+                seq,
+                mavutil.mavlink.MAV_FRAME_GLOBAL,
+                mavutil.mavlink.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION,
+                0, 0,
+                count, 0, 0, 0,
+                loc.lat, loc.lng, 33.0,
+                mission_type
+            )
+            items.append(item)
+            seq += 1
+
+        self.upload_using_mission_protocol(mission_type, items)
+        downloaded_items = self.download_using_mission_protocol(mission_type)
+
+        if len(downloaded_items) != len(items):
+            raise NotAchievedException(f"Mismatch in number of items: sent={len(items)} received={len(downloaded_items)}")
+
+        for i, (sent, received) in enumerate(zip(items, downloaded_items)):
+            mismatches = []
+
+            # Normalize lat/lon to float before comparison
+            sent_lat = sent.x
+            sent_lng = sent.y
+            recv_lat = received.x / 1e7 if isinstance(received.x, int) else received.x
+            recv_lng = received.y / 1e7 if isinstance(received.y, int) else received.y
+
+            if sent.command != received.command:
+                mismatches.append(f"command: {sent.command} != {received.command}")
+            if not math.isclose(sent_lat, recv_lat, abs_tol=1e-2):
+                mismatches.append(f"lat: {sent_lat} != {recv_lat}")
+            if not math.isclose(sent_lng, recv_lng, abs_tol=1e-2):
+                mismatches.append(f"lng: {sent_lng} != {recv_lng}")
+            if not math.isclose(sent.param1, received.param1, abs_tol=1e-3):
+                mismatches.append(f"param1: {sent.param1} != {received.param1}")
+
+            if mismatches:
+                raise NotAchievedException(f"Mismatch in item {i}: " + "; ".join(mismatches))
+
+        print("Fence upload/download verification passed.")
+
     def GPSGlitchLoiter(self, timeout=30, max_distance=20):
         """fly_gps_glitch_loiter_test. Fly south east in loiter and test
         reaction to gps glitch."""
@@ -8633,8 +8699,8 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.set_message_rate_hz("GENERATOR_STATUS", -1)
         self.set_parameter("LOG_DISARMED", 0)
-        if not self.current_onboard_log_contains_message("GEN"):
-            raise NotAchievedException("Did not find expected GEN message")
+        if not self.current_onboard_log_contains_message("RICH"):
+            raise NotAchievedException("Did not find expected RICH message")
 
     def IE24(self):
         '''Test IntelligentEnergy 2.4kWh generator with V1 and V2 telemetry protocols'''
@@ -11918,6 +11984,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
              self.FenceFloorAutoDisableLanding,
              self.FenceFloorAutoEnableOnArming,
              self.FenceMargin,
+             self.FenceUpload_MissionItem,
              self.AutoTuneSwitch,
              self.GPSGlitchLoiter,
              self.GPSGlitchLoiter2,
@@ -13686,6 +13753,56 @@ RTL_ALT 111
         self.change_mode('LOITER')
         self.do_RTL()
 
+    def RCOverridesNoRCReceiver(self):
+        '''test RC override timeout with no RC receiver present'''
+        self.set_parameters({
+            "MAV_GCS_SYSID": 250,
+            "SIM_RC_FAIL": 1,  # no-pulses
+        })
+        self.reboot_sitl()
+
+        rc_send_enabled = True
+        rc1_value = 1500
+        rc2_value = 1500
+        rc3_value = 1000
+        rc4_value = 1500
+
+        # register a hook which sends rcn_values as overrides
+        def rc_override_sender(mav, message):
+            if message.get_type() == 'ATTITUDE':
+                if not rc_send_enabled:
+                    return
+                self.mav.mav.rc_channels_override_send(
+                    mav.target_system, # target system
+                    1, # targe component
+                    rc1_value, # chan1_raw
+                    rc2_value, # chan2_raw
+                    rc3_value, # chan3_raw
+                    rc4_value, # chan4_raw
+                    65535, # chan5_raw
+                    65535, # chan6_raw
+                    65535, # chan7_raw
+                    65535  # chan8_raw
+                )
+        self.install_message_hook_context(rc_override_sender)
+        self.do_set_mode_via_command_int('LOITER')
+        self.wait_ready_to_arm()
+        self.arm_vehicle()
+        self.progress("Takeoff throttle")
+        rc3_value = 1800
+        self.delay_sim_time(1)
+        self.wait_altitude(20, 30, relative=True)
+        self.progress("Neutral throttle")
+        rc3_value = 1600
+        self.progress("yaw ccw")
+        rc4_value = 1450
+        self.wait_yaw_speed(math.radians(-30), accuracy=5, minimum_duration=10)
+        self.progress("Kill overrides and wait for speed to get neutralised")
+        rc_send_enabled = False
+        self.wait_yaw_speed(0, 1, minimum_duration=10)
+        self.do_set_mode_via_command_int('RTL')
+        self.wait_disarmed()
+
     def MISSION_OPTION_CLEAR_MISSION_AT_BOOT(self):
         '''check functionality of mission-clear-at-boot option'''
         self.upload_simple_relhome_mission([
@@ -13783,6 +13900,7 @@ RTL_ALT 111
             self.Sprayer,
             self.AutoContinueOnRCFailsafe,
             self.EK3_RNG_USE_HGT,
+            self.RCOverridesNoRCReceiver,
             self.TerrainDBPreArm,
             self.ThrottleGainBoost,
             self.ScriptMountPOI,
