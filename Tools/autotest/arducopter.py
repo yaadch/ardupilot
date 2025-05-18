@@ -32,7 +32,12 @@ from pymavlink.rotmat import Vector3
 
 # get location of scripts
 testdir = os.path.dirname(os.path.realpath(__file__))
-SITL_START_LOCATION = mavutil.location(-35.362938, 149.165085, 584, 270)
+SITL_START_LOCATION = mavutil.location(
+    -35.362938,
+    149.165085,
+    584.0805053710938,
+    270
+)
 
 # Flight mode switch positions are set-up in arducopter.param to be
 #   switch 1 = Circle
@@ -132,7 +137,9 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                 require_absolute=True,
                 mode="STABILIZE",
                 timeout=120,
-                max_err=5):
+                max_err=5,
+                alt_minimum_duration=0,
+                ):
         """Takeoff get to 30m altitude."""
         self.progress("TAKEOFF")
         self.change_mode(mode)
@@ -144,7 +151,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.user_takeoff(alt_min=alt_min, timeout=timeout, max_err=max_err)
         else:
             self.set_rc(3, takeoff_throttle)
-        self.wait_altitude(alt_min-1, alt_min+max_err, relative=True, timeout=timeout)
+        self.wait_altitude(alt_min-1, alt_min+max_err, relative=True, timeout=timeout, minimum_duration=alt_minimum_duration)
         self.hover()
         self.progress("TAKEOFF COMPLETE")
 
@@ -5526,6 +5533,38 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
         self.do_RTL()
 
+    def WPYawBehaviour1RTL(self):
+        '''ensure behaviour 1 (face home) works in RTL'''
+        self.start_subtest("moving off in guided mode and checking return yaw")
+        self.change_mode('GUIDED')
+        self.wait_ready_to_arm()
+        self.wait_heading(272, timeout=1)  # verify initial heading"
+        self.takeoff(2, mode='GUIDED')
+        self.set_parameter('WP_YAW_BEHAVIOR', 1)  # 1 is face next waypoint
+        self.fly_guided_move_local(100, 100, z_up=20)
+        self.wait_heading(45, timeout=1)
+        self.change_mode('RTL')
+        self.wait_heading(225, minimum_duration=10, timeout=20)
+        self.wait_disarmed()
+
+        self.reboot_sitl()
+        self.start_subtest("now the same but in auto mode")
+        self.upload_simple_relhome_mission([
+            (mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 2),
+            (mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 100, 100, 20),
+            (mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0),
+        ])
+        self.set_parameter('AUTO_OPTIONS', 3)
+        self.change_mode('AUTO')
+        self.set_rc(3, 1000)
+        self.wait_ready_to_arm()
+        self.wait_heading(273, timeout=1)  # verify initial heading"
+        self.arm_vehicle()
+        self.wait_heading(45, minimum_duration=10, timeout=20)
+        self.wait_current_waypoint(3)
+        self.wait_heading(225, minimum_duration=10, timeout=20)
+        self.wait_disarmed()
+
     def TestGripperMission(self):
         '''Test Gripper mission items'''
         num_wp = self.load_mission("copter-gripper-mission.txt")
@@ -9325,20 +9364,16 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
 
     def fly_rangefinder_drivers_fly(self, rangefinders):
         '''ensure rangefinder gives height-above-ground'''
-        self.change_mode('GUIDED')
-        self.wait_ready_to_arm()
-        self.arm_vehicle()
         expected_alt = 5
-        self.user_takeoff(alt_min=expected_alt)
+        self.takeoff(expected_alt, mode='GUIDED', alt_minimum_duration=5)
         rf = self.assert_receive_message("RANGEFINDER")
         gpi = self.assert_receive_message('GLOBAL_POSITION_INT')
-        if gpi is None:
-            raise NotAchievedException("Did not receive GLOBAL_POSITION_INT message")
-        if abs(rf.distance - gpi.relative_alt/1000.0) > 1:
-            raise NotAchievedException(
-                "rangefinder alt (%s) disagrees with global-position-int.relative_alt (%s)" %
-                (rf.distance, gpi.relative_alt/1000.0)
-            )
+        delta = abs(rf.distance - gpi.relative_alt/1000.0)
+        alt_msg = f"{rf.distance=} disagrees with global-position-int.relative_alt ({gpi.relative_alt/1000.0}) by {delta}m"
+        self.progress(alt_msg)
+        self.progress(f"Terrain report: {self.mav.messages['TERRAIN_REPORT']}")
+        if delta > 1:
+            raise NotAchievedException(alt_msg)
 
         for i in range(0, len(rangefinders)):
             name = rangefinders[i]
@@ -9508,7 +9543,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.change_mode('STABILIZE')
             timeout = 60
             tstart = self.get_sim_time()
-            while not self.sensor_has_state(mavutil.mavlink.MAV_SYS_STATUS_PREARM_CHECK, True, True, True):
+            while not self.armed():
                 if self.get_sim_time() - tstart > timeout:
                     raise NotAchievedException("Failed to become armable after %f seconds" % timeout)
                 self.mav.mav.distance_sensor_send(
@@ -9521,7 +9556,10 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
                     mavutil.mavlink.MAV_SENSOR_ROTATION_PITCH_270, # orientation
                     255  # covariance
                 )
-            self.arm_vehicle()
+                try:
+                    self.arm_vehicle()
+                except Exception:
+                    pass
             self.delay_sim_time(1)  # servo function maps only periodically updated
 #            self.send_debug_trap()
 
@@ -9647,13 +9685,17 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         if dist_m > dist_m_max:
             raise NotAchievedException("GSF reset failed, vehicle flew too far (%f > %f)" % (dist_m, dist_m_max))
 
-    def fly_rangefinder_mavlink(self):
+    def FlyRangeFinderMAVlink(self):
+        '''fly mavlink-connected rangefinder'''
         self.fly_rangefinder_mavlink_distance_sensor()
 
         # explicit test for the mavlink driver as it doesn't play so nice:
         self.set_parameters({
             "SERIAL5_PROTOCOL": 1,
             "RNGFND1_TYPE": 10,
+            "RTL_ALT": 500,
+            "RTL_ALT_TYPE": 1,
+            "SIM_TERRAIN": 0,
         })
         self.customise_SITL_commandline(['--serial5=sim:rf_mavlink'])
 
@@ -9748,9 +9790,13 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         if ex is not None:
             raise ex
 
-    def fly_rangefinder_sitl(self):
+    def FlyRangeFinderSITL(self):
+        '''fly the type=100 perfect rangefinder'''
         self.set_parameters({
             "RNGFND1_TYPE": 100,
+            "RTL_ALT": 500,
+            "RTL_ALT_TYPE": 1,
+            "SIM_TERRAIN": 0,
         })
         self.reboot_sitl()
         self.fly_rangefinder_drivers_fly([("unused", "sitl")])
@@ -9761,6 +9807,7 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
         self.set_parameters({
             "RTL_ALT": 500,
             "RTL_ALT_TYPE": 1,
+            "SIM_TERRAIN": 0,
         })
         drivers = [
             ("lightwareserial", 8),  # autodetected between this and -binary
@@ -9782,6 +9829,9 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             ("ainsteinlrd1", 42),
             ("rds02uf", 43),
         ]
+        # you can use terrain - if you don't the vehicle just uses a
+        # plane based on home.
+        # self.install_terrain_handlers_context()
         while len(drivers):
             do_drivers = drivers[0:3]
             drivers = drivers[3:]
@@ -9807,9 +9857,6 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
             self.customise_SITL_commandline(command_line_args)
             self.fly_rangefinder_drivers_fly([x[0] for x in do_drivers])
             self.context_pop()
-
-        self.fly_rangefinder_mavlink()
-        self.fly_rangefinder_sitl()  # i.e. type 100
 
         class I2CDriverToTest:
             def __init__(self, name, rngfnd_type, rngfnd_addr=None):
@@ -12039,6 +12086,8 @@ class AutoTestCopter(vehicle_test_suite.TestSuite):
              self.ModeFollow,
              self.ModeFollow_with_FOLLOW_TARGET,
              self.RangeFinderDrivers,
+             self.FlyRangeFinderMAVlink,
+             self.FlyRangeFinderSITL,
              self.RangeFinderDriversMaxAlt,
              self.RangeFinderDriversLongRange,
              self.RangeFinderSITLLongRange,
@@ -13852,6 +13901,7 @@ RTL_ALT 111
             Test(self.GyroFFTHarmonic, attempts=4, speedup=8),
             Test(self.GyroFFTAverage, attempts=1, speedup=8),
             Test(self.GyroFFTContinuousAveraging, attempts=4, speedup=8),
+            self.WPYawBehaviour1RTL,
             self.GyroFFTPostFilter,
             self.GyroFFTMotorNoiseCheck,
             self.CompassReordering,
