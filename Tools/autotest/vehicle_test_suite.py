@@ -3092,12 +3092,9 @@ class TestSuite(ABC):
         '''returns a set of messages should should be documented but
         are currently known as undocumented'''
         return set([
-            "FENC",  # fence
             "FTN3",  # gyrofft
             "IE24",  # generator
             "IEFC",  # generator
-            "IREG",  # INS something
-            "RTCM",  # GPS
             "SBRE",  # septentrio
 
             "SAF1",  # blimp-sim
@@ -3124,24 +3121,14 @@ class TestSuite(ABC):
             "SMVZ",  # Sim-Volz
 
             "SORC",  # Soaring
-            "VAR",   # soaring
 
             "TCLR",  # tempcal
             "TEMP",  # temperature sensor library
 
-            "ARHS",  # autorotation
-            "AROT",  # autorotation
-            "ARSC",  # autorotation
-            "ATDH",  # heli autotune
-            "ATNH",  # heli autotune
-            "ATSH",  # heli autotune
             "CC",    # AC_CustomControl
+
             "FWDT",  # quadplane
-            "GMB1",  # sologimbal
-            "GMB2",  # sologimbal
             "QBRK",  # quadplane
-            "SURF",  # surface-tracking
-            "ATUN",  # Copter autotune
         ])
 
     def LoggerDocumentation_whitelist(self):
@@ -3169,6 +3156,10 @@ class TestSuite(ABC):
         # documentation (eg. @Path:
         # ../libraries/AP_LandingGear/AP_LandingGear.cpp).
         vinfo_key = self.vehicleinfo_key()
+        if vinfo_key != 'ArduPlane' and vinfo_key != 'ArduCopter' and vinfo_key != 'Helicopter':
+            ret.update([
+                "ATUN",  # Plane and Copter have ATUN messages
+            ])
         if vinfo_key != 'ArduPlane':
             ret.update([
                 "TECS",  # only Plane has TECS
@@ -3178,6 +3169,19 @@ class TestSuite(ABC):
                 "SORC",  # soaring is pure magic
                 "QBRK",  # quadplane
                 "FWDT",  # quadplane
+                "VAR",   # variometer only applicable on Plane
+            ])
+        if vinfo_key != 'ArduCopter' and vinfo_key != "Helicopter":
+            ret.update([
+                "ARHS",    # autorotation
+                "AROT",    # autorotation
+                "ARSC",    # autorotation
+                "ATDH",    # heli autotune
+                "ATNH",    # heli autotune
+                "ATSH",    # heli autotune
+                "GMB1",    # sologimbal
+                "GMB2",    # sologimbal
+                "SURF",    # surface-tracking
             ])
         if vinfo_key == 'ArduCopter':
             ret.update([
@@ -3307,6 +3311,11 @@ class TestSuite(ABC):
                                                (name, label))
         if len(missing) > 0:
             raise NotAchievedException("Documented messages (%s) not in code" % missing)
+
+        # ensure things in the whitelist are not documented:
+        for g in greylist:
+            if g in docco_ids:
+                raise NotAchievedException(f"greylisted ({g}) is actually documented")
 
     def initialise_after_reboot_sitl(self):
 
